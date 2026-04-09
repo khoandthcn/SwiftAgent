@@ -394,19 +394,16 @@ public actor Agent {
         case "web_search":
             let q = json?["query"] as? String ?? ""
             return "Searching web: \"\(q)\""
-        case "search_email":
-            let q = json?["query"] as? String ?? ""
-            return "Searching emails: \"\(q)\""
-        case "read_email":
-            let uid = json?["uid"] as? Int ?? 0
-            return "Reading email #\(uid)"
+        case "check_inbox":
+            let count = json?["count"] as? Int ?? 10
+            return "Checking inbox (last \(count) emails)..."
+        case "find_email":
+            let kw = json?["keyword"] as? String ?? ""
+            return "Finding email: \"\(kw)\""
         case "send_email":
             let to = json?["to"] as? String ?? ""
             let subj = json?["subject"] as? String ?? ""
-            return "Sending email to \(to): \"\(subj)\""
-        case "list_recent_emails":
-            let folder = json?["folder"] as? String ?? "INBOX"
-            return "Listing recent emails in \(folder)"
+            return "Sending to \(to): \"\(subj)\""
         case "search_meetings":
             let q = json?["query"] as? String ?? ""
             return "Searching meetings: \"\(q)\""
