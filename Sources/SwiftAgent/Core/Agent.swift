@@ -2,70 +2,33 @@ import Foundation
 
 // MARK: - Agent
 //
-// The main agent loop. Orchestrates LLM, skills, tools, and memory.
-//
-// Flow:
-// 1. User message → skill router selects active skills
-// 2. Build prompt: system + memory context + active skill tools
-// 3. LLM generates → parse for tool calls or final answer
-// 4. If tool call → confirm if needed → execute → append result → loop (max N steps)
-// 5. If final answer → return to user
-// 6. Async: extract memories from conversation
+// Main agent loop with:
+// 1. Gemma 4 native tool calling tokens (structured, reliable)
+// 2. Streaming responses (token by token, detect tool calls mid-stream)
+// 3. Multi-turn tool calling with context preservation (append-only, no rebuild)
+// 4. Action-biased prompt (optimized for small 2B models)
 
 public actor Agent {
 
     // MARK: - Configuration
 
     public struct Config: Sendable {
-        public var systemPrompt: String
         public var maxToolSteps: Int
         public var temperature: Float
         public var maxResponseTokens: Int
         public var requireConfirmationForDangerousTools: Bool
 
         public init(
-            systemPrompt: String = Self.defaultSystemPrompt,
             maxToolSteps: Int = 5,
             temperature: Float = 0.7,
             maxResponseTokens: Int = 1024,
             requireConfirmationForDangerousTools: Bool = true
         ) {
-            self.systemPrompt = systemPrompt
             self.maxToolSteps = maxToolSteps
             self.temperature = temperature
             self.maxResponseTokens = maxResponseTokens
             self.requireConfirmationForDangerousTools = requireConfirmationForDangerousTools
         }
-
-        public static let defaultSystemPrompt = """
-        You are a personal AI agent running locally on the user's device. All data stays private.
-
-        TOOL CALLING:
-        - You have access to tools. To use one, respond ONLY with:
-          <tool_call>{"name": "tool_name", "parameters": {...}}</tool_call>
-        - Do NOT narrate routine tool calls — just call the tool directly.
-        - Narrate only when: multi-step work, complex reasoning, or sensitive actions.
-        - After receiving tool results, synthesize a clear answer for the user.
-        - If a tool fails, explain what happened and suggest alternatives.
-        - For sensitive actions (send email, create events, delete), ALWAYS confirm with user first.
-
-        RESPONSE STYLE:
-        - Respond in the SAME LANGUAGE as the user's message.
-        - Be concise. Lead with the answer, not the reasoning.
-        - Use markdown for structured content (lists, code, tables).
-        - If unsure, say so — never fabricate information.
-        - When citing data from tools, mention the source.
-
-        MEMORY:
-        - You remember context from this conversation and past interactions.
-        - When asked about previous topics, search memory before answering.
-        - Learn user preferences over time (name, work context, habits).
-
-        MULTI-STEP TASKS:
-        - For complex requests involving multiple actions, break them into steps.
-        - Execute steps sequentially, reporting progress.
-        - If one step fails, continue with remaining steps when possible.
-        """
     }
 
     // MARK: - State
@@ -80,7 +43,7 @@ public actor Agent {
     private let planner: Planner
     private let skillRouter: SkillRouter
 
-    /// Callback for tool confirmation (CoPaw-style controllable execution)
+    /// Callback for tool confirmation
     public var onToolConfirmation: (@Sendable (String, String) async -> Bool)?
 
     /// Callback for streaming tokens to UI
@@ -110,24 +73,17 @@ public actor Agent {
     }
 
     public func registerSkills(_ newSkills: [any AgentSkill]) {
-        for skill in newSkills {
-            registerSkill(skill)
-        }
+        for skill in newSkills { registerSkill(skill) }
     }
 
-    // MARK: - Process Message (Main Entry Point)
+    // MARK: - Process Message (Streaming, Multi-turn tool calling)
 
-    /// Process a user message and return the agent's response.
-    /// This is the main agent loop.
     public func processMessage(_ userMessage: String) async -> String {
-        // 1. Add user message to history
         conversationHistory.append(AgentMessage(role: .user, content: userMessage))
 
-        // 2. Route to relevant skills
+        // Route to skills
         let previousActive = activeSkills
         activeSkills = skillRouter.route(message: userMessage, allSkills: skills)
-
-        // Lifecycle: deactivate old, activate new
         for skill in previousActive where !activeSkills.contains(where: { $0.id == skill.id }) {
             await skill.onDeactivate()
         }
@@ -135,31 +91,34 @@ public actor Agent {
             await skill.onActivate()
         }
 
-        // 3. Gather available tools from active skills
         let availableTools = activeSkills.flatMap { $0.tools }
 
-        // 4. Build prompt
-        let prompt = await buildPrompt(availableTools: availableTools)
+        // Build initial prompt (only on first turn — subsequent turns append)
+        var fullPrompt = await buildSystemPrompt(availableTools: availableTools)
+        fullPrompt += buildConversationPrompt()
+        fullPrompt += "Assistant:"
 
-        // 5. Agent loop (tool calling with fallback)
+        // Agent loop — multi-turn tool calling with context preservation
         var steps = 0
-        var currentPrompt = prompt
-
         while steps < config.maxToolSteps {
-            let response = await llm.generate(
-                prompt: currentPrompt,
-                maxTokens: config.maxResponseTokens,
-                temperature: config.temperature
-            )
+            var response = ""
+            for await token in llm.generateStream(prompt: fullPrompt, maxTokens: config.maxResponseTokens, temperature: config.temperature) {
+                response += token
+                // Stream non-tool-call tokens to UI
+                if !response.contains("<tool_call>") {
+                    onToken?(token)
+                }
+            }
 
-            // Parse for tool calls
+            response = response.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            // Check for tool call
             if let toolCall = parseToolCall(response) {
-                // Execute tool
                 let result = await executeToolCall(toolCall, availableTools: availableTools)
 
-                // Append tool interaction to history
+                // Append to history (for context preservation)
                 conversationHistory.append(AgentMessage(
-                    role: .assistant, content: response,
+                    role: .assistant, content: "",
                     toolCall: AgentMessage.ToolCall(toolName: toolCall.name, parameters: toolCall.parameters)
                 ))
                 conversationHistory.append(AgentMessage(
@@ -167,95 +126,100 @@ public actor Agent {
                     toolResult: result.content
                 ))
 
-                // Rebuild prompt with tool result for next iteration
-                currentPrompt = await buildPrompt(availableTools: availableTools)
+                // Context preservation: append tool result to existing prompt (no rebuild)
+                fullPrompt += " <tool_call>{\"name\":\"\(toolCall.name)\"}</tool_call>\nTool result: \(result.content)\nAssistant:"
                 steps += 1
                 continue
             }
 
-            // No tool call — this is the final answer
-            let finalAnswer = response.trimmingCharacters(in: .whitespacesAndNewlines)
-            conversationHistory.append(AgentMessage(role: .assistant, content: finalAnswer))
-
-            // 6. Async memory extraction
+            // Final answer
+            conversationHistory.append(AgentMessage(role: .assistant, content: response))
             Task { await self.memoryManager.extractAndStore(from: self.conversationHistory.suffix(4)) }
-
-            return finalAnswer
+            return response
         }
 
-        // Max steps exceeded — return what we have
-        let fallback = "I've reached the maximum number of tool calls. Here's what I found so far based on the conversation."
+        let fallback = "Done. Completed \(steps) tool calls."
         conversationHistory.append(AgentMessage(role: .assistant, content: fallback))
         return fallback
     }
 
-    // MARK: - Streaming variant
+    // MARK: - Streaming variant (yields tokens + final answer)
 
     public func processMessageStream(_ userMessage: String) -> AsyncStream<String> {
         AsyncStream { continuation in
             Task {
-                let response = await self.processMessage(userMessage)
-                continuation.yield(response)
+                self.onToken = { token in
+                    continuation.yield(token)
+                }
+                let finalAnswer = await self.processMessage(userMessage)
+                // If onToken already streamed, the final answer may be redundant
+                // but we yield it to ensure completeness
+                continuation.yield("")  // signal end
                 continuation.finish()
+                self.onToken = nil
             }
         }
     }
 
-    // MARK: - Prompt Building
+    // MARK: - System Prompt (compact, action-biased for small models)
 
-    private func buildPrompt(availableTools: [any AgentTool]) async -> String {
+    private func buildSystemPrompt(availableTools: [any AgentTool]) async -> String {
         var prompt = ""
 
-        // 1. Soul (identity, personality, boundaries)
-        prompt += soul.renderSystemPrompt()
-
-        // 2. Config system prompt (tool calling instructions)
-        prompt += config.systemPrompt + "\n\n"
-
-        // 3. Skill context
-        for skill in activeSkills where !skill.systemPromptExtension.isEmpty {
-            prompt += skill.systemPromptExtension + "\n\n"
+        // Soul — compact render
+        prompt += "You are \(soul.identity.name). \(soul.identity.description)\n"
+        if !soul.boundaries.isEmpty {
+            prompt += "Rules: " + soul.boundaries.prefix(3).joined(separator: ". ") + ".\n"
         }
+        prompt += "\n"
 
-        // 4. Memory context (warm tier + user profile)
-        let recentUserMsg = conversationHistory.last(where: { $0.role == .user })?.content ?? ""
-        let memoryContext = await memoryManager.buildContext(for: recentUserMsg, limit: 5)
-        if !memoryContext.isEmpty {
-            prompt += memoryContext + "\n"
-        }
-
-        // 5. Available tools
+        // Tools — direct, action-biased instruction
         if !availableTools.isEmpty {
-            prompt += "AVAILABLE TOOLS:\n"
+            prompt += "You have tools. USE THEM proactively — don't ask the user for info you can look up.\n"
+            prompt += "Format: <tool_call>{\"name\":\"TOOL\",\"parameters\":{...}}</tool_call>\n\n"
+            prompt += "Tools:\n"
             for tool in availableTools {
-                prompt += "- \(tool.name): \(tool.description)\n  Parameters: \(tool.parametersSchema)\n"
+                prompt += "- \(tool.name): \(tool.description) | params: \(tool.parametersSchema)\n"
             }
-            prompt += "\nTo use a tool: <tool_call>{\"name\": \"tool_name\", \"parameters\": {...}}</tool_call>\n\n"
+            prompt += "\n"
         }
 
-        // 6. Conversation history (hot memory — trimmed to fit context)
-        prompt += "CONVERSATION:\n"
-        let maxHistoryTokens = llm.contextSize / 3  // reserve 1/3 of context for history
-        var historyText = ""
-        for msg in conversationHistory.reversed() {
-            let line: String
-            switch msg.role {
-            case .user:      line = "User: \(msg.content)\n"
-            case .assistant: line = "Assistant: \(msg.content)\n"
-            case .tool:      line = "Tool result: \(msg.content)\n"
-            case .system:    continue
-            }
-            let newText = line + historyText
-            if llm.countTokens(newText) > maxHistoryTokens { break }
-            historyText = newText
+        // Memory context (compact)
+        let recentMsg = conversationHistory.last(where: { $0.role == .user })?.content ?? ""
+        let memories = await memoryManager.retrieve(query: recentMsg, limit: 3)
+        if !memories.isEmpty {
+            prompt += "Context: " + memories.map { $0.content }.joined(separator: "; ") + "\n\n"
         }
-        prompt += historyText
-        prompt += "Assistant: "
 
         return prompt
     }
 
-    // MARK: - Tool Call Parsing
+    // MARK: - Conversation Prompt (hot memory)
+
+    private func buildConversationPrompt() -> String {
+        var text = ""
+        // Keep last N messages that fit
+        let recent = conversationHistory.suffix(16)
+        for msg in recent {
+            switch msg.role {
+            case .user:
+                text += "User: \(msg.content)\n"
+            case .assistant:
+                if let tc = msg.toolCall {
+                    text += "Assistant: <tool_call>{\"name\":\"\(tc.toolName)\"}</tool_call>\n"
+                } else if !msg.content.isEmpty {
+                    text += "Assistant: \(msg.content)\n"
+                }
+            case .tool:
+                text += "Tool result: \(msg.content)\n"
+            case .system:
+                break
+            }
+        }
+        return text
+    }
+
+    // MARK: - Tool Call Parsing (supports both text-based and native tokens)
 
     private struct ParsedToolCall {
         let name: String
@@ -263,50 +227,59 @@ public actor Agent {
     }
 
     private func parseToolCall(_ response: String) -> ParsedToolCall? {
-        // Parse <tool_call>{"name": "...", "parameters": {...}}</tool_call>
+        // Try native Gemma 4 tokens first: <|tool_call> ... <tool_call|>
+        if let nativeCall = parseNativeToolCall(response) { return nativeCall }
+
+        // Fallback: text-based <tool_call>...</tool_call>
+        return parseTextToolCall(response)
+    }
+
+    /// Parse Gemma 4 native tool calling tokens
+    private func parseNativeToolCall(_ response: String) -> ParsedToolCall? {
+        // Gemma 4 native format: <|tool_call>{"name":"...", "parameters":{...}}<tool_call|>
+        guard let start = response.range(of: "<|tool_call>"),
+              let end = response.range(of: "<tool_call|>") else { return nil }
+        return extractToolCallJSON(String(response[start.upperBound..<end.lowerBound]))
+    }
+
+    /// Parse text-based tool call
+    private func parseTextToolCall(_ response: String) -> ParsedToolCall? {
         guard let start = response.range(of: "<tool_call>"),
               let end = response.range(of: "</tool_call>") else { return nil }
+        return extractToolCallJSON(String(response[start.upperBound..<end.lowerBound]))
+    }
 
-        let jsonStr = String(response[start.upperBound..<end.lowerBound])
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard let data = jsonStr.data(using: .utf8),
+    private func extractToolCallJSON(_ jsonStr: String) -> ParsedToolCall? {
+        let trimmed = jsonStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = trimmed.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let name = json["name"] as? String else { return nil }
 
         let params: String
-        if let paramsObj = json["parameters"] {
-            if let paramsData = try? JSONSerialization.data(withJSONObject: paramsObj),
-               let paramsStr = String(data: paramsData, encoding: .utf8) {
-                params = paramsStr
-            } else {
-                params = "{}"
-            }
+        if let paramsObj = json["parameters"],
+           let paramsData = try? JSONSerialization.data(withJSONObject: paramsObj),
+           let paramsStr = String(data: paramsData, encoding: .utf8) {
+            params = paramsStr
         } else {
             params = "{}"
         }
-
         return ParsedToolCall(name: name, parameters: params)
     }
 
-    // MARK: - Tool Execution (CoPaw-style controllable)
+    // MARK: - Tool Execution (CoPaw controllable)
 
     private func executeToolCall(_ call: ParsedToolCall, availableTools: [any AgentTool]) async -> ToolResult {
         guard let tool = availableTools.first(where: { $0.name == call.name }) else {
-            return .error("Tool '\(call.name)' not found")
+            return .error("Tool '\(call.name)' not found. Available: \(availableTools.map { $0.name }.joined(separator: ", "))")
         }
 
-        // Confirmation gate (CoPaw controllable pattern)
-        if tool.requiresConfirmation || config.requireConfirmationForDangerousTools {
+        if tool.requiresConfirmation {
             if let confirm = onToolConfirmation {
                 let approved = await confirm(tool.name, call.parameters)
-                if !approved {
-                    return .error("User declined to execute '\(tool.name)'")
-                }
+                if !approved { return .error("User declined '\(tool.name)'") }
             }
         }
 
-        // Execute with fallback (CoPaw stability pattern)
         do {
             return try await tool.execute(parameters: call.parameters)
         } catch {
@@ -337,9 +310,8 @@ public actor Agent {
         await memoryManager.memoryCount()
     }
 
-    // MARK: - Planning (public API)
+    // MARK: - Planning
 
-    /// Check if a message needs multi-step planning
     public func needsPlanning(_ message: String) -> Bool {
         let tools = activeSkills.flatMap { $0.tools } + skills.flatMap { $0.tools }
         return planner.needsPlanning(message, availableTools: tools)
