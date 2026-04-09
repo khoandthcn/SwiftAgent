@@ -173,13 +173,20 @@ public actor Agent {
         }
         prompt += "\n"
 
-        // Tools — direct, action-biased instruction
+        // Tools — direct, action-biased with concrete examples
         if !availableTools.isEmpty {
-            prompt += "You have tools. USE THEM proactively — don't ask the user for info you can look up.\n"
-            prompt += "Format: <tool_call>{\"name\":\"TOOL\",\"parameters\":{...}}</tool_call>\n\n"
+            prompt += "You have tools. USE THEM — don't ask the user for info you can look up.\n"
+            prompt += "To call a tool, output ONLY this JSON (nothing else before or after):\n"
+            prompt += "<tool_call>{\"name\":\"tool_name\",\"parameters\":{\"key\":\"value\"}}</tool_call>\n\n"
+
+            // Concrete example for the first tool
+            if let first = availableTools.first {
+                prompt += "Example: <tool_call>{\"name\":\"\(first.name)\",\"parameters\":{\(first.parametersSchema.contains("query") ? "\"query\":\"example\"" : "")}}</tool_call>\n\n"
+            }
+
             prompt += "Tools:\n"
             for tool in availableTools {
-                prompt += "- \(tool.name): \(tool.description) | params: \(tool.parametersSchema)\n"
+                prompt += "- \(tool.name): \(tool.description)\n"
             }
             prompt += "\n"
         }
@@ -251,19 +258,81 @@ public actor Agent {
 
     private func extractToolCallJSON(_ jsonStr: String) -> ParsedToolCall? {
         let trimmed = jsonStr.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let data = trimmed.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let name = json["name"] as? String else { return nil }
 
-        let params: String
-        if let paramsObj = json["parameters"],
-           let paramsData = try? JSONSerialization.data(withJSONObject: paramsObj),
-           let paramsStr = String(data: paramsData, encoding: .utf8) {
-            params = paramsStr
-        } else {
-            params = "{}"
+        // Try standard JSON first: {"name":"tool","parameters":{...}}
+        if let data = trimmed.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let name = json["name"] as? String {
+            let params: String
+            if let paramsObj = json["parameters"],
+               let paramsData = try? JSONSerialization.data(withJSONObject: paramsObj),
+               let paramsStr = String(data: paramsData, encoding: .utf8) {
+                params = paramsStr
+            } else {
+                params = "{}"
+            }
+            return ParsedToolCall(name: name, parameters: params)
         }
-        return ParsedToolCall(name: name, parameters: params)
+
+        // Fallback: parse loose format like "web_search{query: "..."}"
+        // or "web_search(query="...")" that small models often produce
+        return parsLooseToolCall(trimmed)
+    }
+
+    /// Parse non-standard tool call formats that small models generate
+    private func parsLooseToolCall(_ text: String) -> ParsedToolCall? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // Pattern: "tool_name{key: "value", ...}" or "tool_name{"key": "value"}"
+        // Find tool name (everything before first { or ()
+        let separators = CharacterSet(charactersIn: "{(")
+        guard let sepRange = trimmed.rangeOfCharacter(from: separators) else {
+            // Just a tool name with no params
+            let name = trimmed.trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty && !name.contains(" ") {
+                return ParsedToolCall(name: name, parameters: "{}")
+            }
+            return nil
+        }
+
+        let name = String(trimmed[trimmed.startIndex..<sepRange.lowerBound])
+            .trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty else { return nil }
+
+        // Extract everything between { } or ( )
+        var paramsStr = String(trimmed[sepRange.lowerBound...])
+        paramsStr = paramsStr.replacingOccurrences(of: "(", with: "{")
+        paramsStr = paramsStr.replacingOccurrences(of: ")", with: "}")
+
+        // Fix unquoted keys: {query: "value"} → {"query": "value"}
+        paramsStr = paramsStr.replacingOccurrences(
+            of: "([{,]\\s*)(\\w+)(\\s*:)",
+            with: "$1\"$2\"$3",
+            options: .regularExpression
+        )
+
+        // Try to parse as JSON
+        if let data = paramsStr.data(using: .utf8),
+           let paramsObj = try? JSONSerialization.jsonObject(with: data),
+           let paramsData = try? JSONSerialization.data(withJSONObject: paramsObj),
+           let validParams = String(data: paramsData, encoding: .utf8) {
+            return ParsedToolCall(name: name, parameters: validParams)
+        }
+
+        // Last resort: extract quoted strings as parameters
+        let quotedPattern = "\"([^\"]+)\""
+        let regex = try? NSRegularExpression(pattern: quotedPattern)
+        let matches = regex?.matches(in: paramsStr, range: NSRange(paramsStr.startIndex..., in: paramsStr)) ?? []
+
+        if let firstMatch = matches.first,
+           let range = Range(firstMatch.range(at: 1), in: paramsStr) {
+            let value = String(paramsStr[range])
+            // Guess the param name from tool
+            return ParsedToolCall(name: name, parameters: "{\"query\":\"\(value)\"}")
+        }
+
+        return ParsedToolCall(name: name, parameters: "{}")
     }
 
     // MARK: - Tool Execution (CoPaw controllable)
