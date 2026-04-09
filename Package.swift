@@ -13,12 +13,15 @@ let package = Package(
     dependencies: [
         // LLM inference via llama.cpp
         .package(url: "https://github.com/mattt/llama.swift", from: "2.8665.0"),
+        // IMAP/SMTP email access
+        .package(url: "https://github.com/Cocoanetics/SwiftMail", from: "1.5.0"),
     ],
     targets: [
         .target(
             name: "SwiftAgent",
             dependencies: [
                 .product(name: "LlamaSwift", package: "llama.swift"),
+                .product(name: "SwiftMail", package: "SwiftMail"),
             ],
             path: "Sources/SwiftAgent"
         ),
