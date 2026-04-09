@@ -54,10 +54,12 @@ public actor Agent {
 
     private let llm: any LLMBackend
     private let config: Config
+    private var soul: Soul
     private var skills: [any AgentSkill] = []
     private var activeSkills: [any AgentSkill] = []
     private var conversationHistory: [AgentMessage] = []
     private let memoryManager: MemoryManager
+    private let planner: Planner
     private let skillRouter: SkillRouter
 
     /// Callback for tool confirmation (CoPaw-style controllable execution)
@@ -68,10 +70,17 @@ public actor Agent {
 
     // MARK: - Init
 
-    public init(llm: any LLMBackend, config: Config = Config(), memoryStore: (any MemoryStore)? = nil) {
+    public init(
+        llm: any LLMBackend,
+        config: Config = Config(),
+        soul: Soul = .vietnameseAssistant,
+        memoryStore: (any MemoryStore)? = nil
+    ) {
         self.llm = llm
         self.config = config
+        self.soul = soul
         self.memoryManager = MemoryManager(store: memoryStore ?? InMemoryStore())
+        self.planner = Planner(llm: llm, maxSteps: config.maxToolSteps)
         self.skillRouter = SkillRouter()
     }
 
@@ -177,25 +186,27 @@ public actor Agent {
     // MARK: - Prompt Building
 
     private func buildPrompt(availableTools: [any AgentTool]) async -> String {
-        var prompt = config.systemPrompt + "\n\n"
+        var prompt = ""
 
-        // Skill context
+        // 1. Soul (identity, personality, boundaries)
+        prompt += soul.renderSystemPrompt()
+
+        // 2. Config system prompt (tool calling instructions)
+        prompt += config.systemPrompt + "\n\n"
+
+        // 3. Skill context
         for skill in activeSkills where !skill.systemPromptExtension.isEmpty {
             prompt += skill.systemPromptExtension + "\n\n"
         }
 
-        // Memory context (warm tier)
+        // 4. Memory context (warm tier + user profile)
         let recentUserMsg = conversationHistory.last(where: { $0.role == .user })?.content ?? ""
-        let memories = await memoryManager.retrieveRelevant(for: recentUserMsg, limit: 5)
-        if !memories.isEmpty {
-            prompt += "RELEVANT CONTEXT:\n"
-            for mem in memories {
-                prompt += "- \(mem.content)\n"
-            }
-            prompt += "\n"
+        let memoryContext = await memoryManager.buildContext(for: recentUserMsg, limit: 5)
+        if !memoryContext.isEmpty {
+            prompt += memoryContext + "\n"
         }
 
-        // Available tools
+        // 5. Available tools
         if !availableTools.isEmpty {
             prompt += "AVAILABLE TOOLS:\n"
             for tool in availableTools {
@@ -204,17 +215,23 @@ public actor Agent {
             prompt += "\nTo use a tool: <tool_call>{\"name\": \"tool_name\", \"parameters\": {...}}</tool_call>\n\n"
         }
 
-        // Conversation history (hot memory)
+        // 6. Conversation history (hot memory — trimmed to fit context)
         prompt += "CONVERSATION:\n"
-        let recentHistory = conversationHistory.suffix(20) // keep last 20 messages
-        for msg in recentHistory {
+        let maxHistoryTokens = llm.contextSize / 3  // reserve 1/3 of context for history
+        var historyText = ""
+        for msg in conversationHistory.reversed() {
+            let line: String
             switch msg.role {
-            case .user:    prompt += "User: \(msg.content)\n"
-            case .assistant: prompt += "Assistant: \(msg.content)\n"
-            case .tool:    prompt += "Tool result: \(msg.content)\n"
-            case .system:  break
+            case .user:      line = "User: \(msg.content)\n"
+            case .assistant: line = "Assistant: \(msg.content)\n"
+            case .tool:      line = "Tool result: \(msg.content)\n"
+            case .system:    continue
             }
+            let newText = line + historyText
+            if llm.countTokens(newText) > maxHistoryTokens { break }
+            historyText = newText
         }
+        prompt += historyText
         prompt += "Assistant: "
 
         return prompt
@@ -277,6 +294,37 @@ public actor Agent {
         } catch {
             return .error("Tool '\(call.name)' failed: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Soul Management
+
+    public func getSoul() -> Soul { soul }
+    public func setSoul(_ newSoul: Soul) { soul = newSoul }
+
+    // MARK: - Memory Management
+
+    public func addMemory(_ content: String, type: MemoryEntry.MemoryType) async {
+        await memoryManager.addMemory(content, type: type)
+    }
+
+    public func searchMemory(query: String, limit: Int = 5) async -> [MemoryEntry] {
+        await memoryManager.retrieve(query: query, limit: limit)
+    }
+
+    public func applyMemoryDecay() async {
+        await memoryManager.applyDecay()
+    }
+
+    public func getMemoryCount() async -> Int {
+        await memoryManager.memoryCount()
+    }
+
+    // MARK: - Planning (public API)
+
+    /// Check if a message needs multi-step planning
+    public func needsPlanning(_ message: String) -> Bool {
+        let tools = activeSkills.flatMap { $0.tools } + skills.flatMap { $0.tools }
+        return planner.needsPlanning(message, availableTools: tools)
     }
 
     // MARK: - Session Management
