@@ -348,9 +348,9 @@ public actor Agent {
             return .error("Tool '\(call.name)' not found. Available: \(availableTools.map { $0.name }.joined(separator: ", "))")
         }
 
-        // Emit status: starting tool
-        let friendlyName = tool.description.prefix(60)
-        onToolStatus?("Using \(tool.name)...")
+        // Emit detailed status with parameter summary
+        let paramSummary = summarizeParams(call.parameters, toolName: tool.name)
+        onToolStatus?(paramSummary)
 
         if tool.requiresConfirmation {
             onToolStatus?("Waiting for approval: \(tool.name)")
@@ -366,12 +366,68 @@ public actor Agent {
         do {
             let result = try await tool.execute(parameters: call.parameters)
             // Emit status: done
-            let preview = result.content.prefix(80).replacingOccurrences(of: "\n", with: " ")
-            onToolStatus?(result.isError ? "Failed: \(preview)" : "Done: \(preview)")
+            if result.isError {
+                let preview = result.content.prefix(60).replacingOccurrences(of: "\n", with: " ")
+                onToolStatus?("Failed: \(preview)")
+            } else {
+                let lines = result.content.components(separatedBy: "\n").filter { !$0.isEmpty }
+                if let firstLine = lines.first, lines.count <= 2 {
+                    onToolStatus?("Got: \(firstLine.prefix(60))")
+                } else {
+                    onToolStatus?("Got \(lines.count) results, processing...")
+                }
+            }
             return result
         } catch {
             onToolStatus?("Error: \(error.localizedDescription.prefix(60))")
             return .error("Tool '\(call.name)' failed: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Tool Status Formatting
+
+    /// Create human-readable status from tool name + parameters
+    private func summarizeParams(_ paramsJSON: String, toolName: String) -> String {
+        let json = (try? JSONSerialization.jsonObject(with: Data(paramsJSON.utf8))) as? [String: Any]
+
+        switch toolName {
+        case "web_search":
+            let q = json?["query"] as? String ?? ""
+            return "Searching web: \"\(q)\""
+        case "search_email":
+            let q = json?["query"] as? String ?? ""
+            return "Searching emails: \"\(q)\""
+        case "read_email":
+            let uid = json?["uid"] as? Int ?? 0
+            return "Reading email #\(uid)"
+        case "send_email":
+            let to = json?["to"] as? String ?? ""
+            let subj = json?["subject"] as? String ?? ""
+            return "Sending email to \(to): \"\(subj)\""
+        case "list_recent_emails":
+            let folder = json?["folder"] as? String ?? "INBOX"
+            return "Listing recent emails in \(folder)"
+        case "search_meetings":
+            let q = json?["query"] as? String ?? ""
+            return "Searching meetings: \"\(q)\""
+        case "get_meeting_details":
+            let q = json?["query"] as? String ?? ""
+            return "Loading meeting: \"\(q)\""
+        case "get_action_items":
+            let a = json?["assignee"] as? String ?? "all"
+            return "Getting action items for \(a)"
+        case "get_recent_meetings":
+            return "Loading recent meetings"
+        case "fetch_url":
+            let url = json?["url"] as? String ?? ""
+            return "Fetching: \(url.prefix(40))"
+        case "get_datetime":
+            return "Checking date/time"
+        case "calculate":
+            let expr = json?["expression"] as? String ?? ""
+            return "Calculating: \(expr)"
+        default:
+            return "Using \(toolName)..."
         }
     }
 
