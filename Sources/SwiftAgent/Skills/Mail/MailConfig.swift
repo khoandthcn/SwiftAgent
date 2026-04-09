@@ -46,35 +46,10 @@ public struct MailAccountConfig: Codable, Sendable, Identifiable {
         self.password = password
     }
 
-    // MARK: - Presets
+    // MARK: - Validation
 
-    public static func gmail(email: String, appPassword: String) -> MailAccountConfig {
-        MailAccountConfig(
-            name: "Gmail",
-            email: email,
-            imapHost: "imap.gmail.com", imapPort: 993, imapUseSSL: true,
-            smtpHost: "smtp.gmail.com", smtpPort: 465, smtpUseSSL: true,
-            username: email, password: appPassword
-        )
-    }
-
-    public static func outlook(email: String, password: String) -> MailAccountConfig {
-        MailAccountConfig(
-            name: "Outlook",
-            email: email,
-            imapHost: "outlook.office365.com", imapPort: 993, imapUseSSL: true,
-            smtpHost: "smtp.office365.com", smtpPort: 587, smtpUseSSL: true,
-            username: email, password: password
-        )
-    }
-
-    public static func custom(name: String, email: String, imapHost: String, smtpHost: String, username: String, password: String) -> MailAccountConfig {
-        MailAccountConfig(
-            name: name, email: email,
-            imapHost: imapHost, imapPort: 993, imapUseSSL: true,
-            smtpHost: smtpHost, smtpPort: 465, smtpUseSSL: true,
-            username: username, password: password
-        )
+    public var isValid: Bool {
+        !email.isEmpty && !imapHost.isEmpty && !password.isEmpty
     }
 }
 
