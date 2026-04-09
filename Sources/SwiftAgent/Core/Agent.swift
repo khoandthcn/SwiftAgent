@@ -49,6 +49,9 @@ public actor Agent {
     /// Callback for streaming tokens to UI
     public var onToken: (@Sendable (String) -> Void)?
 
+    /// Callback for tool status updates (e.g. "Searching web...", "Done: 5 results")
+    public var onToolStatus: (@Sendable (String) -> Void)?
+
     // MARK: - Init
 
     public init(
@@ -101,6 +104,7 @@ public actor Agent {
         // Agent loop — multi-turn tool calling with context preservation
         var steps = 0
         while steps < config.maxToolSteps {
+            onToolStatus?(steps == 0 ? "Thinking..." : "Thinking (step \(steps + 1))...")
             var response = ""
             for await token in llm.generateStream(prompt: fullPrompt, maxTokens: config.maxResponseTokens, temperature: config.temperature) {
                 response += token
@@ -133,6 +137,7 @@ public actor Agent {
             }
 
             // Final answer
+            onToolStatus?("")  // clear status
             conversationHistory.append(AgentMessage(role: .assistant, content: response))
             Task { await self.memoryManager.extractAndStore(from: self.conversationHistory.suffix(4)) }
             return response
@@ -339,19 +344,33 @@ public actor Agent {
 
     private func executeToolCall(_ call: ParsedToolCall, availableTools: [any AgentTool]) async -> ToolResult {
         guard let tool = availableTools.first(where: { $0.name == call.name }) else {
+            onToolStatus?("Tool '\(call.name)' not found")
             return .error("Tool '\(call.name)' not found. Available: \(availableTools.map { $0.name }.joined(separator: ", "))")
         }
 
+        // Emit status: starting tool
+        let friendlyName = tool.description.prefix(60)
+        onToolStatus?("Using \(tool.name)...")
+
         if tool.requiresConfirmation {
+            onToolStatus?("Waiting for approval: \(tool.name)")
             if let confirm = onToolConfirmation {
                 let approved = await confirm(tool.name, call.parameters)
-                if !approved { return .error("User declined '\(tool.name)'") }
+                if !approved {
+                    onToolStatus?("Declined: \(tool.name)")
+                    return .error("User declined '\(tool.name)'")
+                }
             }
         }
 
         do {
-            return try await tool.execute(parameters: call.parameters)
+            let result = try await tool.execute(parameters: call.parameters)
+            // Emit status: done
+            let preview = result.content.prefix(80).replacingOccurrences(of: "\n", with: " ")
+            onToolStatus?(result.isError ? "Failed: \(preview)" : "Done: \(preview)")
+            return result
         } catch {
+            onToolStatus?("Error: \(error.localizedDescription.prefix(60))")
             return .error("Tool '\(call.name)' failed: \(error.localizedDescription)")
         }
     }
