@@ -395,15 +395,21 @@ public actor Agent {
             let q = json?["query"] as? String ?? ""
             return "Searching web: \"\(q)\""
         case "check_inbox":
-            let count = json?["count"] as? Int ?? 10
-            return "Checking inbox (last \(count) emails)..."
+            let unread = json?["unread_only"] as? Bool ?? false
+            return unread ? "Checking unread emails..." : "Checking inbox..."
         case "find_email":
-            let kw = json?["keyword"] as? String ?? ""
-            return "Finding email: \"\(kw)\""
+            let kw = json?["keyword"] as? String
+            let from = json?["from"] as? String
+            let query = [kw.map { "about \"\($0)\"" }, from.map { "from \($0)" }].compactMap { $0 }.joined(separator: " ")
+            return "Finding email \(query)..."
         case "send_email":
             let to = json?["to"] as? String ?? ""
             let subj = json?["subject"] as? String ?? ""
             return "Sending to \(to): \"\(subj)\""
+        case "manage_email":
+            let action = json?["action"] as? String ?? ""
+            let kw = json?["keyword"] as? String ?? ""
+            return "\(action.replacingOccurrences(of: "_", with: " ").capitalized): \"\(kw)\""
         case "search_meetings":
             let q = json?["query"] as? String ?? ""
             return "Searching meetings: \"\(q)\""
