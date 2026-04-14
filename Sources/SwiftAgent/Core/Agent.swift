@@ -99,7 +99,7 @@ public actor Agent {
         // Build initial prompt (only on first turn — subsequent turns append)
         var fullPrompt = await buildSystemPrompt(availableTools: availableTools)
         fullPrompt += buildConversationPrompt()
-        fullPrompt += "Assistant:"
+        // Note: don't add "Assistant:" — the LLM backend adds turn tokens
 
         // Agent loop — multi-turn tool calling with context preservation
         var steps = 0
@@ -130,8 +130,8 @@ public actor Agent {
                     toolResult: result.content
                 ))
 
-                // Context preservation: append tool result to existing prompt (no rebuild)
-                fullPrompt += " <tool_call>{\"name\":\"\(toolCall.name)\"}</tool_call>\nTool result: \(result.content)\nAssistant:"
+                // Context preservation: append tool result to existing prompt
+                fullPrompt += "\n[Called \(toolCall.name)]\nResult: \(result.content)\n"
                 steps += 1
                 continue
             }
@@ -148,23 +148,12 @@ public actor Agent {
         return fallback
     }
 
-    // MARK: - Streaming variant (yields tokens + final answer)
-
-    public func processMessageStream(_ userMessage: String) -> AsyncStream<String> {
-        AsyncStream { continuation in
-            Task {
-                self.onToken = { token in
-                    continuation.yield(token)
-                }
-                let finalAnswer = await self.processMessage(userMessage)
-                // If onToken already streamed, the final answer may be redundant
-                // but we yield it to ensure completeness
-                continuation.yield("")  // signal end
-                continuation.finish()
-                self.onToken = nil
-            }
-        }
-    }
+    // MARK: - Streaming
+    //
+    // Streaming works via the onToken callback set by the caller BEFORE
+    // calling processMessage(). processMessage() internally calls
+    // llm.generateStream() and forwards tokens via onToken.
+    // The caller (AgentService) wraps this in an AsyncStream.
 
     // MARK: - System Prompt (compact, action-biased for small models)
 
