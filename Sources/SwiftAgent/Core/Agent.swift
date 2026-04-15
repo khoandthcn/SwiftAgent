@@ -105,22 +105,20 @@ public actor Agent {
         var steps = 0
         while steps < config.maxToolSteps {
             onToolStatus?(steps == 0 ? "Thinking..." : "Thinking (step \(steps + 1))...")
+
+            // Generate full response first (buffer), then decide: tool call or stream to UI
             var response = ""
             for await token in llm.generateStream(prompt: fullPrompt, maxTokens: config.maxResponseTokens, temperature: config.temperature) {
                 response += token
-                // Stream non-tool-call tokens to UI
-                if !response.contains("<tool_call>") {
-                    onToken?(token)
-                }
             }
 
             response = response.trimmingCharacters(in: .whitespacesAndNewlines)
 
             // Check for tool call
             if let toolCall = parseToolCall(response) {
+                // Don't stream tool call text to UI — just execute
                 let result = await executeToolCall(toolCall, availableTools: availableTools)
 
-                // Append to history (for context preservation)
                 conversationHistory.append(AgentMessage(
                     role: .assistant, content: "",
                     toolCall: AgentMessage.ToolCall(toolName: toolCall.name, parameters: toolCall.parameters)
@@ -130,20 +128,28 @@ public actor Agent {
                     toolResult: result.content
                 ))
 
-                // Context preservation: append tool result to existing prompt
                 fullPrompt += "\n[Called \(toolCall.name)]\nResult: \(result.content)\n"
                 steps += 1
                 continue
             }
 
-            // Final answer
-            onToolStatus?("")  // clear status
-            conversationHistory.append(AgentMessage(role: .assistant, content: response))
+            // Final answer — strip any stray tool_call fragments
+            let cleanResponse = cleanToolCallArtifacts(response)
+
+            // Stream the clean final answer to UI
+            onToolStatus?("")
+            for char in cleanResponse {
+                onToken?(String(char))
+            }
+
+            conversationHistory.append(AgentMessage(role: .assistant, content: cleanResponse))
             Task { await self.memoryManager.extractAndStore(from: self.conversationHistory.suffix(4)) }
-            return response
+            return cleanResponse
         }
 
         let fallback = "Done. Completed \(steps) tool calls."
+        onToolStatus?("")
+        onToken?(fallback)
         conversationHistory.append(AgentMessage(role: .assistant, content: fallback))
         return fallback
     }
@@ -218,6 +224,29 @@ public actor Agent {
             }
         }
         return text
+    }
+
+    // MARK: - Clean Tool Call Artifacts
+
+    /// Remove any partial/stray tool_call fragments from response text
+    private func cleanToolCallArtifacts(_ text: String) -> String {
+        var clean = text
+        // Remove complete tool_call blocks
+        while let start = clean.range(of: "<tool_call>"), let end = clean.range(of: "</tool_call>") {
+            clean.removeSubrange(start.lowerBound...end.upperBound)
+        }
+        // Remove native tool call blocks
+        while let start = clean.range(of: "<|tool_call>"), let end = clean.range(of: "<tool_call|>") {
+            clean.removeSubrange(start.lowerBound...end.upperBound)
+        }
+        // Remove partial opening tags
+        if let start = clean.range(of: "<tool_call") {
+            clean = String(clean[clean.startIndex..<start.lowerBound])
+        }
+        if let start = clean.range(of: "<|tool_call") {
+            clean = String(clean[clean.startIndex..<start.lowerBound])
+        }
+        return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     // MARK: - Tool Call Parsing (supports both text-based and native tokens)
